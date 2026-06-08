@@ -1,0 +1,4 @@
+# TTS 离线服务依赖
+edge-tts>=6.1.0
+flask>=2.0.0
+openpyxl>=3.0.0
