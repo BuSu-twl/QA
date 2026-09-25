@@ -4,5 +4,9 @@ openpyxl>=3.0.0
 edge-tts>=6.1.0
 pyttsx3>=2.90
 
+# 标准RAG可选依赖。未安装时服务仍可使用词法检索兜底。
+numpy>=1.26
+sentence-transformers>=3.0
+
 # 打包工具（仅在打包时需要）
 pyinstaller>=5.0.0

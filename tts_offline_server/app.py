@@ -93,7 +93,10 @@ from knowledge_base import (
     get_recommended_questions,
     find_best_match,
     init_knowledge_base,
-    reload_knowledge_base
+    reload_knowledge_base,
+    answer_with_rag,
+    retrieve_knowledge,
+    get_rag_stats
 )
 
 # TTS 引擎和线程锁
@@ -343,25 +346,44 @@ def ask_question():
         return jsonify({'success': False, 'error': '问题不能为空'})
 
     try:
-        # 只从知识库中查找匹配（离线版本不使用 LLM）
-        answer, matched_question = find_best_match(user_question)
-
-        if answer:
-            source = 'knowledge_base'
-        else:
-            answer = "抱歉，知识库中没有找到相关答案。"
-            source = 'none'
+        # 本地 RAG：知识构建 -> 问题检索 -> 证据排序 -> 基于证据生成回答
+        rag_result = answer_with_rag(user_question)
 
         return jsonify({
             'success': True,
-            'answer': answer,
-            'source': source,
-            'question': user_question
+            'answer': rag_result.get('answer'),
+            'source': rag_result.get('source'),
+            'question': user_question,
+            'matched_question': rag_result.get('matched_question'),
+            'confidence': rag_result.get('confidence', 0),
+            'citations': rag_result.get('citations', []),
+            'retrieval': rag_result.get('retrieval', []),
         })
 
     except Exception as e:
         logger.error(f"处理问题时出错: {e}")
         return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/rag/search', methods=['POST'])
+def rag_search():
+    """RAG 检索调试接口：只返回知识块，不生成回答"""
+    data = request.get_json() or {}
+    query = data.get('question') or data.get('query') or ''
+    top_k = int(data.get('top_k', 5) or 5)
+    if not query.strip():
+        return jsonify({'success': False, 'error': '问题不能为空'})
+    return jsonify({
+        'success': True,
+        'query': query,
+        'results': retrieve_knowledge(query, top_k=top_k)
+    })
+
+
+@app.route('/api/rag/stats', methods=['GET'])
+def rag_stats():
+    """RAG 知识库构建状态"""
+    return jsonify({'success': True, 'stats': get_rag_stats()})
 
 
 @app.route('/api/tts/url', methods=['POST'])
@@ -428,9 +450,9 @@ def text_to_speech_url():
 @app.route('/favicon.ico')
 def favicon():
     """Favicon 路由"""
-    favicon_path = os.path.join(_resolve_path('static'), 'avatar_open.png')
+    favicon_path = os.path.join(_resolve_path('static'), 'icon.ico')
     if os.path.exists(favicon_path):
-        return send_file(favicon_path, mimetype='image/png')
+        return send_file(favicon_path, mimetype='image/x-icon')
     return '', 404
 
 
@@ -446,6 +468,7 @@ def health_check():
     return jsonify({
         'status': 'ok',
         'message': '服务正常运行（离线模式）',
+        'rag': get_rag_stats(),
         'tts_available': EDGE_TTS_AVAILABLE,
         'tts_voice': TTS_VOICE if EDGE_TTS_AVAILABLE else None,
         'debug': {
@@ -467,7 +490,7 @@ def reload_kb():
     try:
         success = reload_knowledge_base()
         if success:
-            return jsonify({'success': True, 'message': '知识库已重新加载'})
+            return jsonify({'success': True, 'message': '知识库已重新加载', 'rag': get_rag_stats()})
         else:
             return jsonify({'success': False, 'message': '知识库重新加载失败，请检查数据文件'}), 500
     except Exception as e:
@@ -477,12 +500,13 @@ def reload_kb():
 @app.route('/api/debug/kb', methods=['GET'])
 def debug_knowledge_base():
     """调试接口：查看知识库加载状态和匹配测试"""
-    from knowledge_base import QUESTIONS, QA_PAIRS, QA_DIRECT, get_question_by_id, find_best_match
+    from knowledge_base import QUESTIONS, QA_PAIRS, QA_DIRECT, get_question_by_id, find_best_match, get_rag_stats
     test_q = request.args.get('q', '')
     result = {
         'questions_count': len(QUESTIONS),
         'qa_pairs_count': len(QA_PAIRS),
         'qa_direct_count': len(QA_DIRECT),
+        'rag': get_rag_stats(),
         'questions_sample': [],
         'qa_direct_sample': [],
     }

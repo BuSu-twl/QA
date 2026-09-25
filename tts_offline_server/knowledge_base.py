@@ -5,6 +5,12 @@
 import os
 import sys
 import re
+import math
+import json
+import hashlib
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
 
 # ===== PyInstaller 兼容：确保 XML 解析器可用 =====
 # openpyxl 依赖 xml.etree.ElementTree → pyexpat
@@ -172,6 +178,46 @@ QUESTIONS: List[str] = []
 QA_PAIRS: List[Dict[str, str]] = []
 # 直接的 问答对（question_text → answer），更可靠的匹配方式
 QA_DIRECT: List[Dict[str, str]] = []
+# RAG 知识块与检索索引
+RAG_CHUNKS: List[Dict] = []
+RAG_DOC_FREQ: Dict[str, int] = {}
+RAG_AVG_DOC_LEN: float = 0.0
+RAG_EMBEDDING_MODEL = None
+RAG_EMBEDDING_BACKEND = 'disabled'
+RAG_EMBEDDING_DIM = 0
+RAG_EMBEDDING_CACHE_FILE = _resolve_path('data/embeddings.json')
+RAG_EMBEDDING_MODEL_NAME = os.environ.get(
+    'RAG_EMBEDDING_MODEL',
+    'paraphrase-multilingual-MiniLM-L12-v2',
+)
+RAG_ENABLE_EMBEDDING = os.environ.get('RAG_ENABLE_EMBEDDING', '1').lower() not in {
+    '0', 'false', 'no', 'off'
+}
+RAG_ENABLE_LLM = os.environ.get('RAG_ENABLE_LLM', '0').lower() in {
+    '1', 'true', 'yes', 'on'
+}
+
+RAG_STOP_WORDS = {
+    '的', '了', '是', '在', '有', '和', '与', '及', '等', '都', '也', '还',
+    '又', '被', '把', '让', '给', '向', '从', '到', '这', '那', '哪', '什么',
+    '怎么', '如何', '为什么', '吗', '呢', '啊', '吧', '嘛', '呀', '哦', '嗯',
+    '香连止痢丸', '本品', '该药', '这个药'
+}
+
+RAG_QUERY_EXPANSIONS = [
+    (('成分', '组成', '药材', '处方'), '处方组成 药材 由哪些药材组成'),
+    (('功效', '作用', '效果', '有什么用'), '功效 清热燥湿 理气和胃 健脾止泻'),
+    (('主治', '病症', '症状', '拉肚子', '腹泻', '痢疾'), '主治 病症 小儿急性腹泻 腹痛泄泻'),
+    (('用法', '用量', '怎么吃', '服用', '吃几次', '几次', '几克', '一天', '一日', '每天'), '用法用量 口服 一次 一日'),
+    (('饭前', '饭后', '空腹', '餐前', '餐后', '什么时候吃'), '饭前 饭后 服用'),
+    (('注意', '禁忌', '不能吃', '忌口', '副作用', '高热', '脱水', '就医'), '注意事项 禁用 忌食 就医 寒湿 虚寒'),
+    (('适用', '人群', '儿童', '小儿', '孩子', '谁能吃'), '适用人群 小儿 儿童 患儿'),
+    (('停药', '提前停', '症状好转', '大便正常'), '停药 症状好转 大便正常'),
+    (('感冒药', '感冒', '联用', '一起吃', '同时吃'), '感冒药 慎用 间隔 同服'),
+    (('配伍', '方解', '君臣佐使', '分析'), '配伍特点 君 臣 佐 使'),
+    (('香连丸', '区别', '不同', '一样吗'), '香连丸 区别 药味 功效 剂型'),
+    (('剂型', '微丸', '肠溶', '包衣', '工艺'), '剂型 肠溶微丸 隔离衣 肠溶衣'),
+]
 
 
 def _build_qa_direct():
@@ -215,6 +261,463 @@ def _build_qa_direct():
             })
 
     logger.info(f"构建了 {len(QA_DIRECT)} 个直接问答对")
+    _build_rag_index()
+
+
+def _split_sentences(text: str) -> List[str]:
+    """将答案切分为适合检索展示的知识片段。"""
+    text = (text or '').strip()
+    if not text:
+        return []
+    parts = re.split(r'(?<=[。！？；;])\s*|\n+', text)
+    sentences = [p.strip() for p in parts if p and p.strip()]
+    if not sentences:
+        return [text]
+
+    chunks = []
+    buf = ''
+    for sent in sentences:
+        if not buf:
+            buf = sent
+        elif len(buf) + len(sent) <= 180:
+            buf += sent
+        else:
+            chunks.append(buf)
+            buf = sent
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+def _rag_tokens(text: str) -> List[str]:
+    """轻量中文检索分词：关键词 + 中文 2/3-gram，完全离线无第三方依赖。"""
+    norm = _normalize_text(text)
+    if not norm:
+        return []
+
+    tokens = []
+    for seg in re.split(r'[^\w\u4e00-\u9fff]+', text.lower()):
+        seg = seg.strip()
+        if len(seg) >= 2 and seg not in RAG_STOP_WORDS:
+            tokens.append(seg)
+
+    chinese = ''.join(re.findall(r'[\u4e00-\u9fff]', norm))
+    for n in (2, 3):
+        for i in range(max(0, len(chinese) - n + 1)):
+            token = chinese[i:i+n]
+            if token not in RAG_STOP_WORDS:
+                tokens.append(token)
+
+    # 保序去重，避免少量重复词过度放大
+    seen = set()
+    unique = []
+    for token in tokens:
+        if token and token not in seen:
+            seen.add(token)
+            unique.append(token)
+    return unique
+
+
+def _expand_query_text(query: str) -> str:
+    """本地查询扩展，弥补中文短问句缺少显式知识库关键词的问题。"""
+    norm = _normalize_text(query)
+    expansions = []
+    for triggers, expansion in RAG_QUERY_EXPANSIONS:
+        for trigger in triggers:
+            if _normalize_text(trigger) in norm:
+                expansions.append(expansion)
+                break
+    if not expansions:
+        return query
+    return query + ' ' + ' '.join(expansions)
+
+
+def _hash_embedding(text: str, dimension: int = 384) -> List[float]:
+    """Deterministic offline fallback. It is not semantic and is never reported as model RAG."""
+    vector = [0.0] * dimension
+    for token in _rag_tokens(text):
+        digest = hashlib.sha256(token.encode('utf-8')).digest()
+        index = int.from_bytes(digest[:4], 'big') % dimension
+        sign = 1.0 if digest[4] % 2 else -1.0
+        vector[index] += sign
+    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+    return [value / norm for value in vector]
+
+
+def _load_embedding_model() -> None:
+    """Load an optional multilingual embedding model without making startup depend on it."""
+    global RAG_EMBEDDING_MODEL, RAG_EMBEDDING_BACKEND, RAG_EMBEDDING_DIM
+    if RAG_EMBEDDING_MODEL is not None or RAG_EMBEDDING_BACKEND != 'disabled':
+        return
+    if not RAG_ENABLE_EMBEDDING:
+        RAG_EMBEDDING_BACKEND = 'disabled'
+        return
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        model_path = os.environ.get('RAG_EMBEDDING_MODEL_PATH', '').strip()
+        model_name = model_path or RAG_EMBEDDING_MODEL_NAME
+        RAG_EMBEDDING_MODEL = SentenceTransformer(model_name)
+        probe = RAG_EMBEDDING_MODEL.encode(['probe'], normalize_embeddings=True)
+        RAG_EMBEDDING_DIM = len(probe[0])
+        RAG_EMBEDDING_BACKEND = 'sentence-transformers'
+        logger.info(f"Embedding模型已启用: {model_name}, dim={RAG_EMBEDDING_DIM}")
+    except Exception as exc:
+        # Do not download or fabricate a semantic model during an offline startup.
+        RAG_EMBEDDING_MODEL = None
+        RAG_EMBEDDING_BACKEND = 'unavailable'
+        logger.warning(f"Embedding模型不可用，将仅使用词法召回: {exc}")
+
+
+def _encode_texts(texts: List[str]) -> List[List[float]]:
+    _load_embedding_model()
+    if RAG_EMBEDDING_MODEL is None:
+        return []
+    try:
+        vectors = RAG_EMBEDDING_MODEL.encode(texts, normalize_embeddings=True)
+        return [list(map(float, vector)) for vector in vectors]
+    except Exception as exc:
+        logger.warning(f"Embedding编码失败: {exc}")
+        return []
+
+
+def _cosine_similarity(left: List[float], right: List[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    return sum(a * b for a, b in zip(left, right))
+
+
+def _rerank_candidates(query: str, candidates: List[Tuple[float, Dict]]) -> List[Tuple[float, Dict]]:
+    """Second-stage reranking over hybrid-retrieval candidates."""
+    query_norm = _normalize_text(query)
+    query_tokens = set(_rag_tokens(query))
+    reranked = []
+    for retrieval_score, chunk in candidates:
+        title = chunk.get('title', '')
+        title_norm = _normalize_text(title)
+        title_tokens = set(_rag_tokens(title))
+        overlap = len(query_tokens & title_tokens) / max(len(query_tokens), 1)
+        exact_bonus = 0.18 if query_norm == title_norm else 0.0
+        title_bonus = 0.08 if query_norm and query_norm in title_norm else 0.0
+        type_bonus = 0.04 if chunk.get('chunk_type') == 'qa_full' else 0.0
+        rerank_score = retrieval_score * (1.0 + exact_bonus + title_bonus + type_bonus)
+        rerank_score += 0.15 * overlap
+        chunk['rerank_score'] = rerank_score
+        reranked.append((rerank_score, chunk))
+    reranked.sort(key=lambda item: item[0], reverse=True)
+    return reranked
+
+
+def _load_embedding_cache() -> Dict[str, List[float]]:
+    try:
+        with open(RAG_EMBEDDING_CACHE_FILE, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+        return payload.get('embeddings', {}) if isinstance(payload, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _save_embedding_cache(cache: Dict[str, List[float]]) -> None:
+    try:
+        os.makedirs(os.path.dirname(RAG_EMBEDDING_CACHE_FILE), exist_ok=True)
+        with open(RAG_EMBEDDING_CACHE_FILE, 'w', encoding='utf-8') as handle:
+            json.dump({
+                'model': RAG_EMBEDDING_MODEL_NAME,
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+                'embeddings': cache,
+            }, handle, ensure_ascii=False)
+    except OSError as exc:
+        logger.warning(f"保存Embedding缓存失败: {exc}")
+
+
+def _build_rag_index():
+    """从 Excel 问答对构建本地 RAG 知识库索引。"""
+    global RAG_CHUNKS, RAG_DOC_FREQ, RAG_AVG_DOC_LEN
+
+    chunks = []
+    chunk_id = 1
+    for idx, qa in enumerate(QA_DIRECT, start=1):
+        question = qa.get('question', '').strip()
+        answer = qa.get('answer', '').strip()
+        if not question or not answer:
+            continue
+
+        base_meta = {
+            'question': question,
+            'answer': answer,
+            'source': 'question.xlsx + answer.xlsx',
+            'source_id': f'qa-{idx}',
+        }
+        full_text = f"问题：{question}\n答案：{answer}"
+        chunks.append({
+            **base_meta,
+            'id': f'chunk-{chunk_id}',
+            'title': question,
+            'content': full_text,
+            'chunk_type': 'qa_full',
+        })
+        chunk_id += 1
+
+        for sentence in _split_sentences(answer):
+            if sentence == answer and len(answer) < 220:
+                continue
+            chunks.append({
+                **base_meta,
+                'id': f'chunk-{chunk_id}',
+                'title': question,
+                'content': sentence,
+                'chunk_type': 'answer_evidence',
+            })
+            chunk_id += 1
+
+    doc_freq: Dict[str, int] = {}
+    total_len = 0
+    for chunk in chunks:
+        weighted_text = f"{chunk['title']} {chunk['title']} {chunk['content']}"
+        tokens = _rag_tokens(weighted_text)
+        chunk['tokens'] = tokens
+        chunk['token_counts'] = {t: tokens.count(t) for t in set(tokens)}
+        total_len += len(tokens)
+        for token in set(tokens):
+            doc_freq[token] = doc_freq.get(token, 0) + 1
+
+    # Build a persistent vector index when sentence-transformers is installed.
+    _load_embedding_model()
+    if RAG_EMBEDDING_MODEL is not None and chunks:
+        cache = _load_embedding_cache()
+        pending = []
+        pending_keys = []
+        for chunk in chunks:
+            cache_key = hashlib.sha256(
+                f"{RAG_EMBEDDING_MODEL_NAME}\n{chunk['content']}".encode('utf-8')
+            ).hexdigest()
+            chunk['embedding_key'] = cache_key
+            if cache_key in cache:
+                chunk['embedding'] = cache[cache_key]
+            else:
+                pending.append(chunk['content'])
+                pending_keys.append(cache_key)
+        vectors = _encode_texts(pending)
+        for key, vector in zip(pending_keys, vectors):
+            cache[key] = vector
+        for chunk in chunks:
+            if 'embedding' not in chunk and chunk.get('embedding_key') in cache:
+                chunk['embedding'] = cache[chunk['embedding_key']]
+        if vectors:
+            _save_embedding_cache(cache)
+
+    RAG_CHUNKS = chunks
+    RAG_DOC_FREQ = doc_freq
+    RAG_AVG_DOC_LEN = total_len / len(chunks) if chunks else 0.0
+    logger.info(f"RAG索引构建完成: {len(RAG_CHUNKS)} 个知识块, {len(RAG_DOC_FREQ)} 个检索词")
+
+
+def get_rag_stats() -> Dict:
+    """返回 RAG 知识库状态。"""
+    return {
+        'questions_count': len(QUESTIONS),
+        'qa_pairs_count': len(QA_PAIRS),
+        'qa_direct_count': len(QA_DIRECT),
+        'chunks_count': len(RAG_CHUNKS),
+        'terms_count': len(RAG_DOC_FREQ),
+        'avg_doc_len': round(RAG_AVG_DOC_LEN, 2),
+        'embedding_backend': RAG_EMBEDDING_BACKEND,
+        'embedding_dim': RAG_EMBEDDING_DIM,
+        'vector_chunks_count': sum(1 for chunk in RAG_CHUNKS if chunk.get('embedding')),
+        'llm_enabled': RAG_ENABLE_LLM,
+        'data_dir': DATA_DIR,
+    }
+
+
+def retrieve_knowledge(query: str, top_k: int = 5) -> List[Dict]:
+    """问题检索：返回最相关知识块及可解释评分。"""
+    query = (query or '').strip()
+    if not query or not RAG_CHUNKS:
+        return []
+
+    expanded_query = _expand_query_text(query)
+    query_tokens = _rag_tokens(expanded_query)
+    if not query_tokens:
+        return []
+
+    query_norm = _normalize_text(query)
+    query_vector = _encode_texts([expanded_query])
+    query_vector = query_vector[0] if query_vector else []
+    total_docs = max(len(RAG_CHUNKS), 1)
+    avg_len = RAG_AVG_DOC_LEN or 1.0
+    scored = []
+
+    for chunk in RAG_CHUNKS:
+        score = 0.0
+        doc_len = max(len(chunk.get('tokens', [])), 1)
+        counts = chunk.get('token_counts', {})
+        for token in query_tokens:
+            tf = counts.get(token, 0)
+            if not tf:
+                continue
+            df = RAG_DOC_FREQ.get(token, 0)
+            idf = math.log(1 + (total_docs - df + 0.5) / (df + 0.5))
+            denom = tf + 1.2 * (1 - 0.75 + 0.75 * doc_len / avg_len)
+            score += idf * (tf * 2.2 / denom)
+
+        title_norm = _normalize_text(chunk.get('title', ''))
+        content_norm = _normalize_text(chunk.get('content', ''))
+        expanded_norm = _normalize_text(expanded_query)
+        if query_norm == title_norm:
+            score += 10.0
+        elif query_norm and (query_norm in title_norm or title_norm in query_norm):
+            score += 5.0
+        elif expanded_norm and title_norm and any(_normalize_text(term) in expanded_norm for term in chunk.get('title', '').split()):
+            score += 1.0
+        if query_norm and query_norm in content_norm:
+            score += 2.5
+
+        lexical_score = score
+        vector_score = _cosine_similarity(query_vector, chunk.get('embedding', []))
+        # Hybrid retrieval: semantic score improves paraphrase recall while lexical
+        # matches remain dominant for dosage and contraindication wording.
+        if query_vector and chunk.get('embedding'):
+            score = 0.55 * min(lexical_score / 10.0, 1.0) + 0.45 * max(vector_score, 0.0)
+            score *= 10.0
+
+        if score > 0:
+            scored.append((score, chunk))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if not scored:
+        return []
+
+    scored = _rerank_candidates(query, scored[:max(top_k * 4, 12)])
+    best_score = scored[0][0]
+    results = []
+    seen_content = set()
+    for score, chunk in scored[:max(top_k * 2, top_k)]:
+        key = (chunk.get('source_id'), chunk.get('content'))
+        if key in seen_content:
+            continue
+        seen_content.add(key)
+        results.append({
+            'id': chunk['id'],
+            'title': chunk['title'],
+            'content': chunk['content'],
+            'question': chunk['question'],
+            'source': chunk['source'],
+            'source_id': chunk['source_id'],
+            'chunk_type': chunk['chunk_type'],
+            'score': round(score, 4),
+            'lexical_score': round(lexical_score, 4),
+            'vector_score': round(vector_score, 4),
+            'rerank_score': round(chunk.get('rerank_score', score), 4),
+            'confidence': round(min(score / max(best_score, 0.0001), 1.0), 4),
+        })
+        if len(results) >= top_k:
+            break
+    return results
+
+
+def generate_grounded_answer(query: str, contexts: List[Dict]) -> Dict:
+    """基于检索证据生成回答。离线版采用证据抽取式生成，避免无依据编造。"""
+    if not contexts:
+        return {
+            'success': True,
+            'answer': '抱歉，知识库中没有检索到足够相关的内容，建议换一种问法或咨询专业医师。',
+            'source': 'none',
+            'matched_question': None,
+            'confidence': 0.0,
+            'citations': [],
+            'retrieval': [],
+        }
+
+    top = contexts[0]
+    top_score = top.get('score', 0.0)
+    if top_score < 1.2:
+        return {
+            'success': True,
+            'answer': '抱歉，知识库中没有检索到足够相关的内容，建议从快捷问题中选择或咨询专业医师。',
+            'source': 'rag_low_confidence',
+            'matched_question': top.get('question'),
+            'confidence': round(min(top_score / 4.0, 0.45), 4),
+            'citations': contexts[:3],
+            'retrieval': contexts,
+        }
+
+    matched_question = top.get('question')
+    matched_answer = None
+    for qa in QA_DIRECT:
+        if qa.get('question') == matched_question:
+            matched_answer = qa.get('answer')
+            break
+
+    if not matched_answer:
+        matched_answer = top.get('content', '')
+
+    confidence = min(0.98, max(0.55, top_score / 8.0))
+    llm_answer = _generate_with_llm(query, contexts)
+    if llm_answer:
+        matched_answer = llm_answer
+    return {
+        'success': True,
+        'answer': matched_answer,
+        'source': 'rag_llm' if llm_answer else 'rag',
+        'matched_question': matched_question,
+        'confidence': round(confidence, 4),
+        'citations': contexts[:3],
+        'retrieval': contexts,
+    }
+
+
+def _generate_with_llm(query: str, contexts: List[Dict]) -> Optional[str]:
+    """Call an optional OpenAI-compatible endpoint with strict evidence grounding."""
+    if not RAG_ENABLE_LLM:
+        return None
+    endpoint = os.environ.get('RAG_LLM_ENDPOINT', '').strip()
+    api_key = os.environ.get('RAG_LLM_API_KEY', '').strip()
+    model = os.environ.get('RAG_LLM_MODEL', '').strip()
+    if not endpoint or not model:
+        logger.warning('RAG_ENABLE_LLM 已开启，但未配置 RAG_LLM_ENDPOINT 或 RAG_LLM_MODEL')
+        return None
+    evidence = '\n\n'.join(
+        f"[{index}] {item.get('title', '')}\n{item.get('content', '')}"
+        for index, item in enumerate(contexts[:5], start=1)
+    )
+    payload = json.dumps({
+        'model': model,
+        'temperature': 0.1,
+        'messages': [
+            {
+                'role': 'system',
+                'content': (
+                    '你是香连止痢丸用药问答助手。只能依据给定证据回答，'
+                    '不得补充证据之外的医学事实。证据不足时明确说无法确认。'
+                    '回答简洁，并在相关句末使用[1]、[2]形式引用证据。'
+                ),
+            },
+            {'role': 'user', 'content': f'用户问题：{query}\n\n证据：\n{evidence}'},
+        ],
+    }).encode('utf-8')
+    request = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={
+            'Content-Type': 'application/json',
+            **({'Authorization': f'Bearer {api_key}'} if api_key else {}),
+        },
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=float(os.environ.get('RAG_LLM_TIMEOUT', '12'))) as response:
+            body = json.loads(response.read().decode('utf-8'))
+        answer = body.get('choices', [{}])[0].get('message', {}).get('content', '')
+        return answer.strip() or None
+    except (OSError, ValueError, KeyError, IndexError, urllib.error.URLError) as exc:
+        logger.warning(f'LLM生成失败，回退抽取式答案: {exc}')
+        return None
+
+
+def answer_with_rag(question: str, top_k: int = 5) -> Dict:
+    """完整 RAG 流程：检索 → 证据排序 → 基于证据生成回答。"""
+    contexts = retrieve_knowledge(question, top_k=top_k)
+    return generate_grounded_answer(question, contexts)
 
 
 def get_question_by_id(question_id) -> Optional[str]:
@@ -506,12 +1009,28 @@ def init_knowledge_base():
 
 def find_best_match(question: str) -> Tuple[Optional[str], Optional[str]]:
     """查找最佳匹配的问题和答案"""
+    rag_result = answer_with_rag(question, top_k=3)
+    if rag_result.get('source') == 'rag':
+        return rag_result.get('answer'), rag_result.get('matched_question')
     return find_answer_by_question(question)
 
 
 def get_recommended_questions(question: str, limit: int = 5) -> List[str]:
     """获取推荐问题"""
-    return find_similar_questions(question, exclude=question, limit=limit)
+    retrieved = retrieve_knowledge(question, top_k=limit + 3)
+    recommendations = []
+    for item in retrieved:
+        q = item.get('question')
+        if q and q not in recommendations and _normalize_text(q) != _normalize_text(question):
+            recommendations.append(q)
+        if len(recommendations) >= limit:
+            return recommendations
+    for q in find_similar_questions(question, exclude=question, limit=limit):
+        if q not in recommendations:
+            recommendations.append(q)
+        if len(recommendations) >= limit:
+            break
+    return recommendations
 
 
 def get_all_questions(page: int = 0, page_size: int = 10) -> Dict:
@@ -540,24 +1059,9 @@ def search_answer(question: str) -> Dict:
     搜索答案
     返回: {'success': bool, 'answer': str, 'source': str, 'question': str}
     """
-    # 首先精确匹配
-    answer, matched_question = find_answer_by_question(question)
-
-    if answer:
-        return {
-            'success': True,
-            'answer': answer,
-            'source': 'knowledge_base',
-            'question': matched_question or question
-        }
-
-    # 如果知识库没有答案，返回提示
-    return {
-        'success': True,
-        'answer': '抱歉，知识库中暂未收录该问题的答案。',
-        'source': 'knowledge_base',
-        'question': question
-    }
+    result = answer_with_rag(question)
+    result['question'] = result.get('matched_question') or question
+    return result
 
 
 def get_recommendations(question: str, limit: int = 5) -> List[str]:

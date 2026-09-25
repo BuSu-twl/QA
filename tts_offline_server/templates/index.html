@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>智能问答助手</title>
-    <link rel="icon" type="image/png" href="/static/avatar_open.png">
+    <link rel="icon" type="image/x-icon" href="/static/icon.ico">
     <style>
         * {
             margin: 0;
@@ -188,6 +188,49 @@
         .recommendation-tag:hover {
             background: #667eea;
             color: white;
+        }
+
+        .rag-meta {
+            margin-top: 10px;
+            padding: 10px;
+            background: #f8fafc;
+            border: 1px solid #e5e7eb;
+            border-radius: 10px;
+            font-size: 12px;
+            color: #4b5563;
+        }
+
+        .rag-meta-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 8px;
+            color: #374151;
+            font-weight: 600;
+        }
+
+        .citation-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .citation-item {
+            padding: 8px;
+            background: white;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+        }
+
+        .citation-title {
+            color: #667eea;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .citation-content {
+            color: #555;
+            line-height: 1.45;
         }
 
         .control-btn {
@@ -461,9 +504,9 @@
         <div class="header">
             <!-- 助手头像 -->
             <div class="header-assistant" id="headerAssistant">
-                <img src="/static/avatar_closed.png" alt="助手" class="assistant-avatar" id="assistantAvatar">
+                <img src="/static/avatar_closed.png?v=3" alt="助手" class="assistant-avatar" id="assistantAvatar">
             </div>
-            <h1>医疗咨询助手</h1>
+            <h1>RAG知识库问答助手</h1>
             <div class="status-badge">
                 <span class="status-dot"></span>
                 服务正常
@@ -695,7 +738,7 @@
 
                 if (data.success) {
                     // 准备语音（等待完成后一起显示）
-                    await prepareAudioAndShow(question, data.answer, data.source);
+                    await prepareAudioAndShow(question, data.answer, data.source, data);
                 } else {
                     addMessage('assistant', '抱歉，暂时无法回答您的问题。', 'error');
                 }
@@ -734,7 +777,7 @@
         }
 
         // 准备语音并显示消息
-        async function prepareAudioAndShow(question, answer, source) {
+        async function prepareAudioAndShow(question, answer, source, ragData) {
             showAudioPreparing();
             currentMessageId = 'msg-' + Date.now();
 
@@ -748,7 +791,7 @@
 
                 removeAudioPreparing();
 
-                const msgId = addMessage('assistant', answer, source, question);
+                const msgId = addMessage('assistant', answer, source, question, ragData);
 
                 if (ttsData.success && ttsData.audio_url) {
                     currentAudioUrl = ttsData.audio_url;
@@ -760,7 +803,7 @@
             } catch (error) {
                 removeAudioPreparing();
                 console.error('语音合成失败:', error);
-                const msgId = addMessage('assistant', answer, source, question);
+                const msgId = addMessage('assistant', answer, source, question, ragData);
                 loadRecommendations(question, msgId);
             }
         }
@@ -833,7 +876,40 @@
         }
 
         // 添加消息
-        function addMessage(type, content, source, originalQuestion) {
+        function renderRagMeta(ragData) {
+            if (!ragData || !ragData.citations || !ragData.citations.length) {
+                return '';
+            }
+            const confidence = Math.round((ragData.confidence || 0) * 100);
+            const matched = ragData.matched_question ? escapeHtml(ragData.matched_question) : '未命中标准问题';
+            const citations = ragData.citations.slice(0, 3).map((item, idx) => `
+                <div class="citation-item">
+                    <div class="citation-title">证据 ${idx + 1} · ${escapeHtml(item.title || item.question || '知识片段')} · 分数 ${escapeHtml(String(item.score || 0))}</div>
+                    <div class="citation-content">${escapeHtml(item.content || '').slice(0, 180)}</div>
+                </div>
+            `).join('');
+            return `
+                <div class="rag-meta">
+                    <div class="rag-meta-header">
+                        <span>RAG检索置信度：${confidence}%</span>
+                        <span>匹配：${matched}</span>
+                    </div>
+                    <div class="citation-list">${citations}</div>
+                </div>
+            `;
+        }
+
+        function sourceLabel(source) {
+            if (source === 'rag') return 'RAG知识库';
+            if (source === 'rag_llm') return 'RAG + LLM';
+            if (source === 'rag_low_confidence') return 'RAG低置信度';
+            if (source === 'knowledge_base') return '知识库';
+            if (source === 'llm') return 'AI助手';
+            if (source === 'none') return '未检索到';
+            return source || '未知';
+        }
+
+        function addMessage(type, content, source, originalQuestion, ragData) {
             const chatArea = document.getElementById('chatArea');
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${type}`;
@@ -854,11 +930,12 @@
                 messageId = 'msg-' + Date.now();
                 messageDiv.innerHTML = `
                     <div class="message-avatar">
-                        <img src="/static/avatar_closed.png" alt="助手" class="message-avatar" style="width:40px;height:40px;border-radius:50%;object-fit:cover;">
+                        <img src="/static/avatar_closed.png?v=3" alt="助手" class="message-avatar" style="width:40px;height:40px;border-radius:50%;object-fit:cover;">
                     </div>
                     <div class="message-content" data-message-id="${messageId}">
-                        ${source ? `<div style="font-size:12px;color:#888;margin-bottom:6px;">来源: ${source === 'knowledge_base' ? '知识库' : source === 'llm' ? 'AI助手' : '其他'}</div>` : ''}
+                        ${source ? `<div style="font-size:12px;color:#888;margin-bottom:6px;">来源: ${sourceLabel(source)}</div>` : ''}
                         <div class="message-bubble" id="${messageId}">${escapeHtml(content)}</div>
+                        ${renderRagMeta(ragData)}
                         <div class="audio-controls" id="controls-${messageId}">
                             <button class="control-btn btn-play" onclick="resumeOrPlayAudio('${messageId}')" disabled style="opacity:0.5">
                                 <span>▶</span> 播放
@@ -955,7 +1032,7 @@
         function setAvatarSpeaking(speaking) {
             const avatar = document.getElementById('assistantAvatar');
             if (avatar) {
-                avatar.src = speaking ? '/static/avatar_open.png' : '/static/avatar_closed.png';
+                avatar.src = speaking ? '/static/avatar_open.png?v=3' : '/static/avatar_closed.png?v=3';
             }
         }
 

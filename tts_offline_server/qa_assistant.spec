@@ -59,7 +59,7 @@ if os.path.exists(icon_file):
             print("[WARN] icon.ico 不是有效的 ICO 格式，跳过图标")
             try:
                 from PIL import Image
-                png_file = os.path.join(BASE_DIR, 'static', 'avatar_open.png')
+                png_file = os.path.join(BASE_DIR, 'static', 'icon.ico')
                 if os.path.exists(png_file):
                     img = Image.open(png_file)
                     img.save(icon_file, format='ICO', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])

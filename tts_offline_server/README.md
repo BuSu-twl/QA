@@ -2,7 +2,25 @@
 
 ## 概述
 
-本项目是一个基于知识库的医疗问答助手，支持**完全离线运行**，无需网络连接即可使用知识库问答和语音合成功能。
+本项目是一个面向香连止痢丸知识库的医疗问答助手，已升级为轻量 RAG 架构，支持**完全离线运行**。系统会从 Excel 构建知识库，生成本地知识块索引，完成问题检索、证据排序和基于证据的回答生成，并保留语音合成功能。
+
+## RAG 流程
+
+```
+question.xlsx / answer.xlsx
+        ↓
+知识库加载与问答对校验
+        ↓
+知识块构建（完整问答块 + 答案证据块）
+        ↓
+本地检索索引（中文关键词 + 2/3-gram + BM25式评分）
+        ↓
+问题检索与 query expansion
+        ↓
+证据排序、置信度计算、生成回答
+        ↓
+网页展示回答 + 检索证据 + 语音播报
+```
 
 ## 文件结构
 
@@ -155,7 +173,11 @@ python app.py --port 8080
 | 功能 | 说明 | 离线可用 |
 |------|------|---------|
 | 登录验证 | 本地字符串比较 | ✓ |
-| 知识库问答 | 匹配 Excel 中的问答 | ✓ |
+| RAG 知识库构建 | 从 Excel 构建知识块和检索索引 | ✓ |
+| 混合召回 | BM25式词法召回 + 可选多语Embedding向量召回 | ✓ |
+| 二阶段重排 | 对候选证据进行问题类型、标题和关键词重排 | ✓ |
+| 生成回答 | 默认证据抽取；配置兼容接口后使用受控LLM生成 | ✓ |
+| 证据展示 | 前端显示置信度和 Top 证据块 | ✓ |
 | 语音合成 | Edge-TTS 本地合成 | ✓ |
 | 推荐问题 | 基于关键词匹配 | ✓ |
 | 快捷问题 | 分页显示 | ✓ |
@@ -164,7 +186,7 @@ python app.py --port 8080
 
 | 功能 | 说明 | 备注 |
 |------|------|------|
-| LLM 生成答案 | 需要网络调用 | 离线版本不支持 |
+| 自动下载Embedding模型 | 需要预先下载模型到本地 | 设置 `RAG_EMBEDDING_MODEL_PATH` |
 
 ## 知识库格式
 
@@ -261,6 +283,39 @@ TTS_VOICE = "zh-CN-YunyangNeural"  # 修改为其他语音
 
 ## 扩展：在其他项目中使用 knowledge_base.py
 
+### 标准RAG配置
+
+安装 `requirements.txt` 中的可选依赖后，将多语Embedding模型放入本地目录，
+并设置：
+
+```powershell
+$env:RAG_ENABLE_EMBEDDING = "1"
+$env:RAG_EMBEDDING_MODEL_PATH = "D:\models\paraphrase-multilingual-MiniLM-L12-v2"
+```
+
+服务会在 `data/embeddings.json` 缓存向量，检索接口会同时返回
+`lexical_score`、`vector_score` 和 `rerank_score`。
+
+如需接入 OpenAI 兼容的大模型接口：
+
+```powershell
+$env:RAG_ENABLE_LLM = "1"
+$env:RAG_LLM_ENDPOINT = "https://your-endpoint/v1/chat/completions"
+$env:RAG_LLM_API_KEY = "your-key"
+$env:RAG_LLM_MODEL = "your-model"
+```
+
+LLM 只接收检索到的 Top 5 证据，并被要求使用 `[1]`、`[2]` 引用；
+请求失败时自动回退到证据抽取式回答。
+
+### RAG评测
+
+```powershell
+python evaluate_rag.py
+```
+
+脚本输出 `Hit@5`、`MRR` 和 `grounded_answer_rate`，用于回归验收。
+
 ### 导入方式
 
 ```python
@@ -272,7 +327,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from knowledge_base import (
     init_knowledge_base,
-    find_best_match,
+    answer_with_rag,
+    retrieve_knowledge,
+    get_rag_stats,
     get_recommended_questions,
     get_paginated_questions
 )
@@ -280,9 +337,18 @@ from knowledge_base import (
 # 初始化
 init_knowledge_base()
 
-# 查找答案
-answer = find_best_match("用法用量")
-print(f"答案: {answer}")
+# RAG 问答
+result = answer_with_rag("香连止痢丸一天吃几次？")
+print(result["answer"])
+print(result["confidence"])
+print(result["citations"])
+
+# 仅检索证据
+chunks = retrieve_knowledge("有哪些禁忌？", top_k=3)
+print(chunks)
+
+# 查看索引状态
+print(get_rag_stats())
 
 # 获取推荐
 recommendations = get_recommended_questions("用法用量")
@@ -306,8 +372,23 @@ print(f"问题列表: {result['questions']}")
     'total_pages': 2
 }
 
-# find_best_match 返回
-"口服，一次3-6克，一日2-3次。"
+# answer_with_rag 返回
+{
+    'success': True,
+    'answer': '口服，一次3～6g，一日2～3次。',
+    'source': 'rag',
+    'matched_question': '香连止痢丸的用法用量？',
+    'confidence': 0.98,
+    'citations': [
+        {
+            'title': '香连止痢丸的用法用量？',
+            'content': '问题：... 答案：...',
+            'score': 50.0103,
+            'source': 'question.xlsx + answer.xlsx'
+        }
+    ],
+    'retrieval': [...]
+}
 
 # get_recommended_questions 返回
 ['该处方由哪些药材组成的？', '该处方适用于哪些病症？', ...]
